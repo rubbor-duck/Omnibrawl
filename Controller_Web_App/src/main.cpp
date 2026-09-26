@@ -1,138 +1,319 @@
 #include <Arduino.h>
-// Load Wi-Fi library
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <WiFi.h>
 
-// Replace with your network credentials
-const char* ssid     = "ESP32-Access-Point";
-const char* password = "123456789";
+// The ESP32 creates this Wi-Fi network. The password must be at least 8 characters.
+const char *AP_SSID = "ESP32-Robot";
+const char *AP_PASSWORD = "123456789";
 
-// Set web server port number to 80
-WiFiServer server(80);
+AsyncWebServer server(80);
 
-// Variable to store the HTTP request
-String header;
+// The web-server callback and loop() can run on different ESP32 CPU cores.
+// This lock keeps the X, Y, and timestamp values together as one command.
+portMUX_TYPE joystickMutex = portMUX_INITIALIZER_UNLOCKED;
 
-// Auxiliar variables to store the current output state
-String output26State = "off";
-String output27State = "off";
+// The most recent joystick command. Each axis ranges from -100 to 100.
+volatile int joystickX = 0;
+volatile int joystickY = 0;
+volatile unsigned long lastJoystickUpdate = 0;
 
-// Assign output variables to GPIO pins
-const int output26 = 26;
-const int output27 = 27;
+// Stop the robot if the controller stops sending updates unexpectedly.
+const unsigned long COMMAND_TIMEOUT_MS = 500;
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Omnibrawl Controller</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+      overflow: hidden;
+      background: #111827;
+      color: #f9fafb;
+      font-family: Arial, sans-serif;
+      text-align: center;
+    }
+
+    h1,
+    p {
+      margin: 0;
+    }
+
+    #joystick {
+      position: relative;
+      width: min(72vw, 360px);
+      aspect-ratio: 1;
+      border: 4px solid #64748b;
+      border-radius: 50%;
+      background:
+        linear-gradient(#334155 0 0) center / 2px 100% no-repeat,
+        linear-gradient(90deg, #334155 0 0) center / 100% 2px no-repeat,
+        #1e293b;
+      box-shadow: inset 0 0 30px #0f172a;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+    }
+
+    #joystick.active {
+      cursor: grabbing;
+      border-color: #38bdf8;
+    }
+
+    #knob {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 30%;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: #38bdf8;
+      box-shadow: 0 6px 18px rgb(0 0 0 / 45%);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+
+    #values {
+      min-width: 13rem;
+      padding: 0.75rem 1rem;
+      border-radius: 0.75rem;
+      background: #1e293b;
+      font: 1.25rem monospace;
+    }
+
+    .hint {
+      color: #94a3b8;
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>Omnibrawl Controller</h1>
+  <div id="joystick" aria-label="Robot movement joystick">
+    <div id="knob"></div>
+  </div>
+  <p id="values">X: 0&nbsp;&nbsp;Y: 0</p>
+  <p class="hint">Drag with a mouse or one finger. Release to stop.</p>
+
+  <script>
+    const joystick = document.getElementById("joystick");
+    const knob = document.getElementById("knob");
+    const values = document.getElementById("values");
+
+    let activePointerId = null;
+    let x = 0;
+    let y = 0;
+    let lastSentAt = 0;
+    const SEND_INTERVAL_MS = 50;
+    const HEARTBEAT_INTERVAL_MS = 100;
+
+    function sendCommand(force = false) {
+      const now = performance.now();
+      if (!force && now - lastSentAt < SEND_INTERVAL_MS) {
+        return;
+      }
+
+      lastSentAt = now;
+      fetch(`/joystick?x=${x}&y=${y}`, {
+        cache: "no-store",
+        keepalive: true
+      }).catch(() => {
+        // The ESP32 timeout stops the robot if communication is lost.
+      });
+    }
+
+    function updateJoystick(clientX, clientY) {
+      const rect = joystick.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const maximumDistance = (rect.width - knob.offsetWidth) / 2;
+
+      let offsetX = clientX - centerX;
+      let offsetY = clientY - centerY;
+      const distance = Math.hypot(offsetX, offsetY);
+
+      if (distance > maximumDistance) {
+        const scale = maximumDistance / distance;
+        offsetX *= scale;
+        offsetY *= scale;
+      }
+
+      knob.style.transform =
+        `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+
+      x = Math.round((offsetX / maximumDistance) * 100);
+      // Screen coordinates increase downward, so invert Y to make forward positive.
+      y = Math.round((-offsetY / maximumDistance) * 100);
+      values.textContent = `X: ${x}  Y: ${y}`;
+      sendCommand();
+    }
+
+    function stopJoystick() {
+      if (activePointerId === null && x === 0 && y === 0) {
+        return;
+      }
+
+      activePointerId = null;
+      x = 0;
+      y = 0;
+      knob.style.transform = "translate(-50%, -50%)";
+      joystick.classList.remove("active");
+      values.textContent = "X: 0  Y: 0";
+      sendCommand(true);
+    }
+
+    joystick.addEventListener("pointerdown", event => {
+      if (activePointerId !== null) {
+        return;
+      }
+
+      activePointerId = event.pointerId;
+      joystick.setPointerCapture(event.pointerId);
+      joystick.classList.add("active");
+      updateJoystick(event.clientX, event.clientY);
+    });
+
+    joystick.addEventListener("pointermove", event => {
+      if (event.pointerId === activePointerId) {
+        updateJoystick(event.clientX, event.clientY);
+      }
+    });
+
+    joystick.addEventListener("pointerup", event => {
+      if (event.pointerId === activePointerId) {
+        stopJoystick();
+      }
+    });
+
+    joystick.addEventListener("pointercancel", stopJoystick);
+    joystick.addEventListener("lostpointercapture", stopJoystick);
+    joystick.addEventListener("contextmenu", event => event.preventDefault());
+    window.addEventListener("blur", stopJoystick);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopJoystick();
+      }
+    });
+
+    // Continue sending while held still so the ESP32 knows the controller is alive.
+    setInterval(() => {
+      if (activePointerId !== null) {
+        sendCommand(true);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  </script>
+</body>
+</html>
+)rawliteral";
 
 void setup() {
   Serial.begin(115200);
-  // Initialize the output variables as outputs
-  pinMode(output26, OUTPUT);
-  pinMode(output27, OUTPUT);
-  // Set outputs to LOW
-  digitalWrite(output26, LOW);
-  digitalWrite(output27, LOW);
 
-  // Connect to Wi-Fi network with SSID and password
-  Serial.print("Setting AP (Access Point)…");
-  // Remove the password parameter, if you want the AP (Access Point) to be open
-  WiFi.softAP(ssid, password);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
 
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-  
-  server.begin();
-}
+  Serial.println();
+  Serial.println("Wi-Fi access point started.");
+  Serial.print("Network name: ");
+  Serial.println(AP_SSID);
+  Serial.print("Controller address: http://");
+  Serial.println(WiFi.softAPIP());
 
-void loop(){
-  WiFiClient client = server.available();   // Listen for incoming clients
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.print("Webpage requested by ");
+    Serial.println(request->client()->remoteIP());
 
-  if (client) {                             // If a new client connects,
-    Serial.println("New Client.");          // print a message out in the serial port
-    String currentLine = "";                // make a String to hold incoming data from the client
-    while (client.connected()) {            // loop while the client's connected
-      if (client.available()) {             // if there's bytes to read from the client,
-        char c = client.read();             // read a byte, then
-        Serial.write(c);                    // print it out the serial monitor
-        header += c;
-        if (c == '\n') {                    // if the byte is a newline character
-          // if the current line is blank, you got two newline characters in a row.
-          // that's the end of the client HTTP request, so send a response:
-          if (currentLine.length() == 0) {
-            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
-            // and a content-type so the client knows what's coming, then a blank line:
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-type:text/html");
-            client.println("Connection: close");
-            client.println();
-            
-            // turns the GPIOs on and off
-            if (header.indexOf("GET /26/on") >= 0) {
-              Serial.println("GPIO 26 on");
-              output26State = "on";
-              digitalWrite(output26, HIGH);
-            } else if (header.indexOf("GET /26/off") >= 0) {
-              Serial.println("GPIO 26 off");
-              output26State = "off";
-              digitalWrite(output26, LOW);
-            } else if (header.indexOf("GET /27/on") >= 0) {
-              Serial.println("GPIO 27 on");
-              output27State = "on";
-              digitalWrite(output27, HIGH);
-            } else if (header.indexOf("GET /27/off") >= 0) {
-              Serial.println("GPIO 27 off");
-              output27State = "off";
-              digitalWrite(output27, LOW);
-            }
-            
-            // Display the HTML web page
-            client.println("<!DOCTYPE html><html>");
-            client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-            client.println("<link rel=\"icon\" href=\"data:,\">");
-            // CSS to style the on/off buttons 
-            // Feel free to change the background-color and font-size attributes to fit your preferences
-            client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
-            client.println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
-            client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
-            client.println(".button2 {background-color: #555555;}</style></head>");
-            
-            // Web Page Heading
-            client.println("<body><h1>ESP32 Web Server</h1>");
-            
-            // Display current state, and ON/OFF buttons for GPIO 26  
-            client.println("<p>GPIO 26 - State " + output26State + "</p>");
-            // If the output26State is off, it displays the ON button       
-            if (output26State=="off") {
-              client.println("<p><a href=\"/26/on\"><button class=\"button\">ON</button></a></p>");
-            } else {
-              client.println("<p><a href=\"/26/off\"><button class=\"button button2\">OFF</button></a></p>");
-            } 
-               
-            // Display current state, and ON/OFF buttons for GPIO 27  
-            client.println("<p>GPIO 27 - State " + output27State + "</p>");
-            // If the output27State is off, it displays the ON button       
-            if (output27State=="off") {
-              client.println("<p><a href=\"/27/on\"><button class=\"button\">ON</button></a></p>");
-            } else {
-              client.println("<p><a href=\"/27/off\"><button class=\"button button2\">OFF</button></a></p>");
-            }
-            client.println("</body></html>");
-            
-            // The HTTP response ends with another blank line
-            client.println();
-            // Break out of the while loop
-            break;
-          } else { // if you got a newline, then clear currentLine
-            currentLine = "";
-          }
-        } else if (c != '\r') {  // if you got anything else but a carriage return character,
-          currentLine += c;      // add it to the end of the currentLine
-        }
-      }
+    AsyncWebServerResponse *response =
+        request->beginResponse(200, "text/html", INDEX_HTML);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  server.on("/joystick", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("x") || !request->hasParam("y")) {
+      Serial.print("Invalid joystick request from ");
+      Serial.println(request->client()->remoteIP());
+      request->send(400, "text/plain", "Missing x or y value");
+      return;
     }
-    // Clear the header variable
-    header = "";
-    // Close the connection
-    client.stop();
-    Serial.println("Client disconnected.");
-    Serial.println("");
-  }
+
+    const int newX =
+        constrain(request->getParam("x")->value().toInt(), -100, 100);
+    const int newY =
+        constrain(request->getParam("y")->value().toInt(), -100, 100);
+    bool commandChanged;
+
+    portENTER_CRITICAL(&joystickMutex);
+    commandChanged = newX != joystickX || newY != joystickY;
+    joystickX = newX;
+    joystickY = newY;
+    lastJoystickUpdate = millis();
+    portEXIT_CRITICAL(&joystickMutex);
+
+    // Heartbeats repeat the same command, so only print values that change.
+    if (commandChanged) {
+      Serial.printf("Joystick command received: X: %d, Y: %d\n", newX, newY);
+    }
+
+    request->send(204, "text/plain", "");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    Serial.print("Unknown page requested by ");
+    Serial.print(request->client()->remoteIP());
+    Serial.print(": ");
+    Serial.println(request->url());
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  lastJoystickUpdate = millis();
 }
 
+void loop() {
+  static uint8_t previousDeviceCount = 0;
+  const uint8_t deviceCount = WiFi.softAPgetStationNum();
+
+  if (deviceCount != previousDeviceCount) {
+    if (deviceCount > previousDeviceCount) {
+      Serial.printf("Device connected to Wi-Fi. Connected devices: %u\n",
+                    deviceCount);
+    } else {
+      Serial.printf("Device disconnected from Wi-Fi. Connected devices: %u\n",
+                    deviceCount);
+    }
+    previousDeviceCount = deviceCount;
+  }
+
+  bool commandTimedOut = false;
+  const unsigned long now = millis();
+
+  portENTER_CRITICAL(&joystickMutex);
+  if ((joystickX != 0 || joystickY != 0) &&
+      now - lastJoystickUpdate > COMMAND_TIMEOUT_MS) {
+    joystickX = 0;
+    joystickY = 0;
+    commandTimedOut = true;
+  }
+  portEXIT_CRITICAL(&joystickMutex);
+
+  if (commandTimedOut) {
+    Serial.println("Controller timed out; command reset to X: 0, Y: 0");
+  }
+
+  // Later, joystickX and joystickY will be converted into individual motor speeds here.
+}
