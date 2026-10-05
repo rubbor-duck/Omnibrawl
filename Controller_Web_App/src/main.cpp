@@ -2,6 +2,20 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <WiFi.h>
+#include <math.h>
+#include <BasicLinearAlgebra.h>
+
+// Matrixes for the motor translations
+BLA::Matrix<3,2> A; // "A" is the cos/sine x and y translation for each wheel
+BLA::Matrix<2> v;   // "v" is where the x and y data from the joystick goes into
+
+// {Cos(1), Sin(0), Cos(120), Sin(120), Cos(240), Sin(240)}
+A = {1, 0, -0.5, 0.866025403784, -0.5, -0.866025403784};
+v.Fill(0);
+
+volatile int motor_0 = 0;
+volatile int motor_120 = 0;
+volatile int motor_240 = 0;
 
 // The ESP32 creates this Wi-Fi network. The password must be at least 8 characters.
 const char *AP_SSID = "ESP32-Robot";
@@ -429,6 +443,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// function skeleton ready for matrix multiplication implementation
+void motor_matrix_translation(int x, int y, int z){
+v = {x, y};
+
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -498,6 +518,8 @@ void setup() {
 
   server.begin();
   lastJoystickUpdate = millis();
+
+  
 }
 
 void loop() {
