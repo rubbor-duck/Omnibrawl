@@ -9,10 +9,6 @@
 BLA::Matrix<3,2> A; // "A" is the cos/sine x and y translation for each wheel
 BLA::Matrix<2> v;   // "v" is where the x and y data from the joystick goes into
 
-// {Cos(1), Sin(0), Cos(120), Sin(120), Cos(240), Sin(240)}
-A = {1, 0, -0.5, 0.866025403784, -0.5, -0.866025403784};
-v.Fill(0);
-
 volatile int motor_0 = 0;
 volatile int motor_120 = 0;
 volatile int motor_240 = 0;
@@ -24,13 +20,14 @@ const char *AP_PASSWORD = "123456789";
 AsyncWebServer server(80);
 
 // The web-server callback and loop() can run on different ESP32 CPU cores.
-// This lock keeps the X, Y, Z, and timestamp values together as one command.
+// This lock keeps X, Y, Z, heading validity, and timestamp together.
 portMUX_TYPE joystickMutex = portMUX_INITIALIZER_UNLOCKED;
 
-// X and Y range from -100 to 100. Z is relative heading from -180 to 180 degrees.
+// X and Y range from -100 to 100. Z is magnetic heading from 0 to 359 degrees.
 volatile int joystickX = 0;
 volatile int joystickY = 0;
 volatile int joystickZ = 0;
+volatile bool headingValid = false;
 volatile unsigned long lastJoystickUpdate = 0;
 
 // Stop the robot if the controller stops sending updates unexpectedly.
@@ -138,6 +135,133 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       font-size: 0.9rem;
     }
 
+    #compass-panel {
+      position: fixed;
+      top: 0.75rem;
+      left: 0.75rem;
+      width: 9rem;
+      padding: 0.6rem;
+      border-radius: 0.9rem;
+      background: rgb(15 23 42 / 90%);
+      box-shadow: 0 5px 18px rgb(0 0 0 / 35%);
+      z-index: 2;
+    }
+
+    #compass {
+      position: relative;
+      width: 6.5rem;
+      aspect-ratio: 1;
+      margin: 0 auto 0.4rem;
+      border: 3px solid #64748b;
+      border-radius: 50%;
+      background:
+        linear-gradient(#334155 0 0) center / 1px 100% no-repeat,
+        linear-gradient(90deg, #334155 0 0) center / 100% 1px no-repeat,
+        #1e293b;
+      touch-action: none;
+      user-select: none;
+    }
+
+    #compass.manual {
+      border-color: #fbbf24;
+      cursor: grab;
+    }
+
+    #north-needle {
+      position: absolute;
+      inset: 0.45rem;
+      transform: rotate(0deg);
+      pointer-events: none;
+    }
+
+    #north-needle::before {
+      content: "";
+      position: absolute;
+      left: calc(50% - 2px);
+      top: 0.6rem;
+      width: 4px;
+      height: calc(50% - 0.6rem);
+      border-radius: 3px;
+      background: #38bdf8;
+    }
+
+    #north-needle::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 0;
+      border-right: 0.38rem solid transparent;
+      border-bottom: 0.7rem solid #38bdf8;
+      border-left: 0.38rem solid transparent;
+      transform: translateX(-50%);
+    }
+
+    #forward-marker {
+      position: absolute;
+      left: 50%;
+      top: 1.4rem;
+      color: white;
+      font-size: 1.1rem;
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    #compass-center {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 0.55rem;
+      aspect-ratio: 1;
+      border: 2px solid #f8fafc;
+      border-radius: 50%;
+      background: #0f172a;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+
+    #heading-readout,
+    #heading-source {
+      margin-top: 0.25rem;
+      font-size: 0.75rem;
+    }
+
+    #heading-source {
+      color: #94a3b8;
+    }
+
+    #calibrate-north {
+      width: 100%;
+      margin-top: 0.45rem;
+      padding: 0.45rem;
+      border: 0;
+      border-radius: 0.5rem;
+      background: #fbbf24;
+      color: #422006;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    #calibration-hint {
+      margin-top: 0.35rem;
+      color: #fbbf24;
+      font-size: 0.68rem;
+      line-height: 1.2;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 600px) {
+      #compass-panel {
+        width: 7.4rem;
+      }
+
+      #compass {
+        width: 5.25rem;
+      }
+    }
+
     .hint {
       color: #94a3b8;
       font-size: 0.9rem;
@@ -145,6 +269,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
+  <aside id="compass-panel" aria-label="Magnetic compass">
+    <div id="compass">
+      <div id="north-needle"></div>
+      <div id="forward-marker" title="Phone forward">&#9650;</div>
+      <div id="compass-center"></div>
+    </div>
+    <p id="heading-readout">Heading: --</p>
+    <p id="heading-source">Compass inactive</p>
+    <button id="calibrate-north" type="button" hidden>Calibrate North</button>
+    <p id="calibration-hint" hidden>Drag the blue needle toward magnetic north, then calibrate.</p>
+  </aside>
   <h1>Omnibrawl Controller</h1>
   <div id="joystick" aria-label="Robot movement joystick">
     <div id="knob"></div>
@@ -160,14 +295,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const values = document.getElementById("values");
     const tiltButton = document.getElementById("tilt-button");
     const sensorStatus = document.getElementById("sensor-status");
+    const compass = document.getElementById("compass");
+    const northNeedle = document.getElementById("north-needle");
+    const headingReadout = document.getElementById("heading-readout");
+    const headingSource = document.getElementById("heading-source");
+    const calibrateNorthButton = document.getElementById("calibrate-north");
+    const calibrationHint = document.getElementById("calibration-hint");
 
     let activePointerId = null;
     let x = 0;
     let y = 0;
     let z = 0;
+    let headingIsValid = false;
     let tiltEnabled = false;
     let tiltCalibration = null;
     let orientationReceived = false;
+    let absoluteHeadingReceived = false;
+    let latestRelativeHeading = null;
+    let manualHeadingOffset = null;
+    let manualNorthNeedleAngle = 0;
     let lastSentAt = 0;
     const SEND_INTERVAL_MS = 50;
     const HEARTBEAT_INTERVAL_MS = 100;
@@ -180,7 +326,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
 
       lastSentAt = now;
-      fetch(`/joystick?x=${x}&y=${y}&z=${z}`, {
+      fetch(`/joystick?x=${x}&y=${y}&z=${z}&headingValid=${headingIsValid ? 1 : 0}`, {
         cache: "no-store",
         keepalive: true
       }).catch(() => {
@@ -195,7 +341,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
       knob.style.transform =
         `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
-      values.textContent = `X: ${x}  Y: ${y}  Z: ${z}\u00b0`;
+      const displayedHeading = headingIsValid ? `${z}\u00b0` : "--";
+      values.textContent = `X: ${x}  Y: ${y}  Z: ${displayedHeading}`;
     }
 
     function limitToCircle(nextX, nextY) {
@@ -233,7 +380,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     function stopJoystick() {
-      if (activePointerId === null && x === 0 && y === 0 && z === 0) {
+      if (activePointerId === null && x === 0 && y === 0 && z === 0 &&
+          !headingIsValid) {
         return;
       }
 
@@ -241,6 +389,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       x = 0;
       y = 0;
       z = 0;
+      headingIsValid = false;
       joystick.classList.remove("active");
       renderCommand();
       sendCommand(true);
@@ -261,20 +410,100 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       return { x: gamma, y: beta };
     }
 
-    function getHeading(event) {
-      // iPhones expose a compass heading through this WebKit property.
-      if (Number.isFinite(event.webkitCompassHeading)) {
-        return event.webkitCompassHeading;
-      }
-      if (Number.isFinite(event.alpha)) {
-        // Convert the standard counterclockwise alpha angle to clockwise heading.
-        return (360 - event.alpha) % 360;
-      }
-      return null;
+    function normalize360(angle) {
+      return ((angle % 360) + 360) % 360;
     }
 
-    function normalizeHeading(angle) {
-      return ((angle + 540) % 360) - 180;
+    function calculateCompassHeading(alpha, beta, gamma) {
+      if (!Number.isFinite(alpha) || !Number.isFinite(beta) ||
+          !Number.isFinite(gamma)) {
+        return null;
+      }
+
+      const degreesToRadians = Math.PI / 180;
+      const xRotation = beta * degreesToRadians;
+      const yRotation = gamma * degreesToRadians;
+      const zRotation = alpha * degreesToRadians;
+      const cosX = Math.cos(xRotation);
+      const cosY = Math.cos(yRotation);
+      const cosZ = Math.cos(zRotation);
+      const sinX = Math.sin(xRotation);
+      const sinY = Math.sin(yRotation);
+      const sinZ = Math.sin(zRotation);
+      const vectorX = -cosZ * sinY - sinZ * sinX * cosY;
+      const vectorY = -sinZ * sinY + cosZ * sinX * cosY;
+
+      // When the phone is almost perfectly flat, alpha alone gives heading.
+      if (Math.hypot(vectorX, vectorY) < 0.000001) {
+        return normalize360(360 - alpha);
+      }
+
+      return normalize360(Math.atan2(vectorX, vectorY) / degreesToRadians);
+    }
+
+    function getHeadingReading(event) {
+      const relativeHeading = calculateCompassHeading(
+        event.alpha, event.beta, event.gamma
+      );
+
+      // Safari provides a clockwise magnetic heading directly.
+      if (Number.isFinite(event.webkitCompassHeading) &&
+          event.webkitCompassHeading >= 0) {
+        return {
+          absolute: normalize360(event.webkitCompassHeading),
+          relative: relativeHeading,
+          source: "Automatic magnetic heading"
+        };
+      }
+
+      // Other browsers must explicitly identify their Earth-referenced data.
+      if ((event.type === "deviceorientationabsolute" || event.absolute === true) &&
+          relativeHeading !== null) {
+        return {
+          absolute: relativeHeading,
+          relative: relativeHeading,
+          source: "Automatic absolute heading"
+        };
+      }
+
+      return { absolute: null, relative: relativeHeading, source: null };
+    }
+
+    function hideManualCalibration() {
+      compass.classList.remove("manual");
+      calibrateNorthButton.hidden = true;
+      calibrationHint.hidden = true;
+    }
+
+    function showManualCalibration() {
+      if (!tiltEnabled || absoluteHeadingReceived) {
+        return;
+      }
+
+      compass.classList.add("manual");
+      calibrateNorthButton.hidden = false;
+      calibrationHint.hidden = false;
+      headingSource.textContent = "Manual north calibration needed";
+      northNeedle.style.transform =
+        `rotate(${manualNorthNeedleAngle}deg)`;
+    }
+
+    function displayHeading(heading, source) {
+      z = Math.round(normalize360(heading)) % 360;
+      headingIsValid = true;
+      const northAngle = normalize360(360 - z);
+      northNeedle.style.transform = `rotate(${northAngle}deg)`;
+      headingReadout.textContent = `Heading: ${z}\u00b0`;
+      headingSource.textContent = source;
+    }
+
+    function clearHeadingDisplay() {
+      z = 0;
+      headingIsValid = false;
+      northNeedle.style.transform = "rotate(0deg)";
+      headingReadout.textContent = "Heading: --";
+      headingSource.textContent = "Compass inactive";
+      hideManualCalibration();
     }
 
     function handleOrientation(event) {
@@ -284,16 +513,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
 
       const tilt = getScreenAdjustedTilt(event.beta, event.gamma);
-      const heading = getHeading(event);
+      const heading = getHeadingReading(event);
       orientationReceived = true;
+      latestRelativeHeading = heading.relative;
+
+      if (heading.absolute !== null) {
+        absoluteHeadingReceived = true;
+        manualHeadingOffset = null;
+        hideManualCalibration();
+        displayHeading(heading.absolute, heading.source);
+      } else if (manualHeadingOffset !== null && heading.relative !== null) {
+        displayHeading(
+          heading.relative + manualHeadingOffset,
+          "Manually calibrated magnetic heading"
+        );
+      }
 
       if (tiltCalibration === null) {
-        tiltCalibration = { x: tilt.x, y: tilt.y, heading };
+        tiltCalibration = { x: tilt.x, y: tilt.y };
         sensorStatus.textContent =
           "Tilt control active. The current position is the neutral position.";
         x = 0;
         y = 0;
-        z = 0;
         renderCommand();
         sendCommand(true);
         return;
@@ -305,9 +546,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       );
       x = limited.x;
       y = limited.y;
-      z = heading === null || tiltCalibration.heading === null
-        ? 0
-        : Math.round(normalizeHeading(heading - tiltCalibration.heading));
 
       renderCommand();
       sendCommand();
@@ -336,18 +574,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         tiltEnabled = true;
         tiltCalibration = null;
         orientationReceived = false;
+        absoluteHeadingReceived = false;
+        latestRelativeHeading = null;
+        manualHeadingOffset = null;
+        manualNorthNeedleAngle = 0;
+        clearHeadingDisplay();
         joystick.classList.add("tilt-active");
         tiltButton.classList.add("enabled");
         tiltButton.textContent = "Disable Tilt Control";
         sensorStatus.textContent =
           "Hold the phone in a comfortable neutral position...";
         window.addEventListener("deviceorientation", handleOrientation);
+        window.addEventListener("deviceorientationabsolute", handleOrientation);
 
         setTimeout(() => {
           if (tiltEnabled && !orientationReceived) {
             sensorStatus.textContent = window.isSecureContext
               ? "No orientation data received. Check this browser's motion permissions."
               : "No orientation data received. This browser may require an HTTPS page.";
+          } else if (tiltEnabled && !absoluteHeadingReceived &&
+                     manualHeadingOffset === null) {
+            showManualCalibration();
           }
         }, 2500);
       } catch (error) {
@@ -366,12 +613,62 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       tiltEnabled = false;
       tiltCalibration = null;
       window.removeEventListener("deviceorientation", handleOrientation);
+      window.removeEventListener("deviceorientationabsolute", handleOrientation);
       joystick.classList.remove("tilt-active");
       tiltButton.classList.remove("enabled");
       tiltButton.textContent = "Enable Tilt Control";
       sensorStatus.textContent = message;
       stopJoystick();
+      clearHeadingDisplay();
     }
+
+    function updateManualNorthNeedle(clientX, clientY) {
+      const rect = compass.getBoundingClientRect();
+      const offsetX = clientX - (rect.left + rect.width / 2);
+      const offsetY = clientY - (rect.top + rect.height / 2);
+      manualNorthNeedleAngle = Math.round(
+        normalize360(Math.atan2(offsetX, -offsetY) * 180 / Math.PI)
+      );
+      northNeedle.style.transform =
+        `rotate(${manualNorthNeedleAngle}deg)`;
+    }
+
+    compass.addEventListener("pointerdown", event => {
+      if (!compass.classList.contains("manual")) {
+        return;
+      }
+      compass.setPointerCapture(event.pointerId);
+      updateManualNorthNeedle(event.clientX, event.clientY);
+    });
+
+    compass.addEventListener("pointermove", event => {
+      if (compass.classList.contains("manual") &&
+          compass.hasPointerCapture(event.pointerId)) {
+        updateManualNorthNeedle(event.clientX, event.clientY);
+      }
+    });
+
+    calibrateNorthButton.addEventListener("click", () => {
+      if (latestRelativeHeading === null) {
+        sensorStatus.textContent =
+          "No relative heading is available for manual calibration.";
+        return;
+      }
+
+      const selectedPhoneHeading = normalize360(360 - manualNorthNeedleAngle);
+      manualHeadingOffset = normalize360(
+        selectedPhoneHeading - latestRelativeHeading
+      );
+      hideManualCalibration();
+      displayHeading(
+        latestRelativeHeading + manualHeadingOffset,
+        "Manually calibrated magnetic heading"
+      );
+      sensorStatus.textContent =
+        "Manual north calibration saved for this control session.";
+      renderCommand();
+      sendCommand(true);
+    });
 
     tiltButton.addEventListener("click", () => {
       if (tiltEnabled) {
@@ -447,7 +744,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 void motor_matrix_translation(int x, int y, int z){
 v = {x, y};
 
+BLA::Matrix<3, 1> D = A * v;
+
+
 }
+
+
 
 void setup() {
   Serial.begin(115200);
@@ -484,25 +786,34 @@ void setup() {
         constrain(request->getParam("x")->value().toInt(), -100, 100);
     const int newY =
         constrain(request->getParam("y")->value().toInt(), -100, 100);
-    const int newZ = request->hasParam("z")
+    const bool newHeadingValid = request->hasParam("headingValid") &&
+                                 request->getParam("headingValid")->value() == "1";
+    const int newZ = newHeadingValid && request->hasParam("z")
                          ? constrain(request->getParam("z")->value().toInt(),
-                                     -180, 180)
+                                     0, 359)
                          : 0;
     bool commandChanged;
 
     portENTER_CRITICAL(&joystickMutex);
     commandChanged =
-        newX != joystickX || newY != joystickY || newZ != joystickZ;
+        newX != joystickX || newY != joystickY || newZ != joystickZ ||
+        newHeadingValid != headingValid;
     joystickX = newX;
     joystickY = newY;
     joystickZ = newZ;
+    headingValid = newHeadingValid;
     lastJoystickUpdate = millis();
     portEXIT_CRITICAL(&joystickMutex);
 
     // Heartbeats repeat the same command, so only print values that change.
     if (commandChanged) {
-      Serial.printf("Control command received: X: %d, Y: %d, Z: %d degrees\n",
-                    newX, newY, newZ);
+      if (newHeadingValid) {
+        Serial.printf("Control command received: X: %d, Y: %d, heading: %d degrees\n",
+                      newX, newY, newZ);
+      } else {
+        Serial.printf("Control command received: X: %d, Y: %d, heading unavailable\n",
+                      newX, newY);
+      }
     }
 
     request->send(204, "text/plain", "");
@@ -519,7 +830,10 @@ void setup() {
   server.begin();
   lastJoystickUpdate = millis();
 
-  
+  // Matrixs filled up with setup data
+  // {Cos(1), Sin(0), Cos(120), Sin(120), Cos(240), Sin(240)}
+  A = {1, 0, -0.5, 0.866025403784, -0.5, -0.866025403784};
+  v.Fill(0);
 }
 
 void loop() {
@@ -541,17 +855,18 @@ void loop() {
   const unsigned long now = millis();
 
   portENTER_CRITICAL(&joystickMutex);
-  if ((joystickX != 0 || joystickY != 0 || joystickZ != 0) &&
+  if ((joystickX != 0 || joystickY != 0 || headingValid) &&
       now - lastJoystickUpdate > COMMAND_TIMEOUT_MS) {
     joystickX = 0;
     joystickY = 0;
     joystickZ = 0;
+    headingValid = false;
     commandTimedOut = true;
   }
   portEXIT_CRITICAL(&joystickMutex);
 
   if (commandTimedOut) {
-    Serial.println("Controller timed out; command reset to X: 0, Y: 0, Z: 0");
+    Serial.println("Controller timed out; movement stopped and heading invalidated");
   }
 
   // Later, X/Y can drive motor speed and Z can control robot heading here.
