@@ -414,37 +414,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       return ((angle % 360) + 360) % 360;
     }
 
-    function calculateCompassHeading(alpha, beta, gamma) {
-      if (!Number.isFinite(alpha) || !Number.isFinite(beta) ||
-          !Number.isFinite(gamma)) {
-        return null;
-      }
-
-      const degreesToRadians = Math.PI / 180;
-      const xRotation = beta * degreesToRadians;
-      const yRotation = gamma * degreesToRadians;
-      const zRotation = alpha * degreesToRadians;
-      const cosX = Math.cos(xRotation);
-      const cosY = Math.cos(yRotation);
-      const cosZ = Math.cos(zRotation);
-      const sinX = Math.sin(xRotation);
-      const sinY = Math.sin(yRotation);
-      const sinZ = Math.sin(zRotation);
-      const vectorX = -cosZ * sinY - sinZ * sinX * cosY;
-      const vectorY = -sinZ * sinY + cosZ * sinX * cosY;
-
-      // When the phone is almost perfectly flat, alpha alone gives heading.
-      if (Math.hypot(vectorX, vectorY) < 0.000001) {
-        return normalize360(360 - alpha);
-      }
-
-      return normalize360(Math.atan2(vectorX, vectorY) / degreesToRadians);
-    }
-
     function getHeadingReading(event) {
-      const relativeHeading = calculateCompassHeading(
-        event.alpha, event.beta, event.gamma
-      );
+      // Alpha is counterclockwise, while compass headings increase clockwise.
+      // Keeping beta/gamma out of this calculation prevents movement tilt from
+      // changing the direction reported by the phone's magnetometer.
+      const relativeHeading = Number.isFinite(event.alpha)
+        ? normalize360(360 - event.alpha)
+        : null;
 
       // Safari provides a clockwise magnetic heading directly.
       if (Number.isFinite(event.webkitCompassHeading) &&
