@@ -5,6 +5,9 @@
 #include <math.h>
 #include <BasicLinearAlgebra.h>
 
+//TODO: Change Compass to work when the tilt controls are disabled
+// Change to https so it works with iphone
+
 // Matrixes for the motor translations
 BLA::Matrix<3,2> A; // "A" is the cos/sine x and y translation for each wheel
 BLA::Matrix<2> v;   // "v" is where the x and y data from the joystick goes into
