@@ -2,41 +2,45 @@
 #include <BasicLinearAlgebra.h>
 #include "main.hpp"
 #include "web_server.hpp"
+#include "robot.hpp"
+#include "movement.hpp"
 
-namespace {
-BLA::Matrix<3, 2> wheelMatrix;
-BLA::Matrix<2> inputVector;
-}
-
-void initializeDrive() {
-    // Same 3-wheel transformation matrix as the original.
-    wheelMatrix = {1, 0, -0.5, 0.866025403784, -0.5, -0.866025403784};
-    inputVector.Fill(0);
-}
-
-void motor_matrix_translation(int x, int y, int heading) {
-    inputVector = {x, y};
-    BLA::Matrix<3, 1> wheelOutputs = wheelMatrix * inputVector;
-    // Same as the original: results are calculated but not applied to motors.
-    (void)wheelOutputs;
-    (void)heading;
-}
-
-void updateDrive() {
-    const ControlCommand command = WebServer::getCommand();
-    motor_matrix_translation(command.x, command.y, command.heading);
-    Serial.println("");
-
-    // headingValid is reserved for the future heading-aware drive logic.
-}
 
 void setup() {
     Serial.begin(115200);
     WebServer::begin();
-    initializeDrive();
+    initializeTransformations();
 }
+
+Robot robot1;
+
+std::array<float, 3> motorPercentages = {0.0, 0.0, 0.0};
+int joystickX = 0;
+int joystickY = 0;
+int imuHeading = 0;
+int phoneHeading = 0;
 
 void loop() {
     WebServer::update();
-    updateDrive();
+
+    // 1a. Get joystick XY value (USING WEBS_SERVER.CPP)
+    const ControlCommand commandToRobot = WebServer::getCommand();
+
+    joystickX = commandToRobot.x;
+    joystickY = commandToRobot.y;
+    phoneHeading = commandToRobot.heading;
+
+    // 1b. Get IMU measurements (WILL USE IMU.CPP)
+    // const IMUData imuData = IMU::getData();
+    imuHeading = imuHeading;
+
+    // 2. Calculate motor percentages (USING MOVEMENT.CPP)
+    motorPercentages = calcMotorPercentages(joystickX, joystickY, phoneHeading, imuHeading);
+    
+    //3. Store motor percentages in robot instance (USING ROBOT.CPP)
+    robot1.setRobotMotorPercentages(motorPercentages[0], motorPercentages[1], motorPercentages[2]);
+
+    // 3. Apply robot's motor percentages to drivers (USING MOTOR_CONTROLLER.CPP)
+    // MotorDriver::update(robot.getMotorPercentages());
+    
 }
