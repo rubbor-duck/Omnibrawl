@@ -1,16 +1,18 @@
 #include "web_server.hpp"
 
 #include <Arduino.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <esp_https_server.h>
+#include <cstdlib>
+#include <cstring>
 #include <WiFi.h>
+#include <LittleFS.h>
 
 namespace {
 constexpr char AP_SSID[] = "ESP32-Robot";
 constexpr char AP_PASSWORD[] = "123456789";
 constexpr unsigned long COMMAND_TIMEOUT_MS = 500;
 
-AsyncWebServer server(80);
+httpd_handle_t server = nullptr;
 portMUX_TYPE joystickMutex = portMUX_INITIALIZER_UNLOCKED;
 ControlCommand currentCommand;
 unsigned long lastJoystickUpdate = 0;
@@ -699,82 +701,169 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+
+  esp_err_t handleRoot(httpd_req_t *request) {
+      httpd_resp_set_type(request, "text/html");
+      httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+      return httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t handleJoystick(httpd_req_t *request) {
+      char query[128];
+      const size_t queryLength = httpd_req_get_url_query_len(request);
+
+      if (queryLength == 0 || queryLength >= sizeof(query) ||
+          httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK) {
+          return httpd_resp_send_err(
+              request, HTTPD_400_BAD_REQUEST, "Invalid query string");
+      }
+
+      char xText[8] = {};
+      char yText[8] = {};
+
+      if (httpd_query_key_value(query, "x", xText, sizeof(xText)) != ESP_OK ||
+          httpd_query_key_value(query, "y", yText, sizeof(yText)) != ESP_OK) {
+          return httpd_resp_send_err(
+              request, HTTPD_400_BAD_REQUEST, "Missing x or y value");
+      }
+
+      const int newX = constrain(atoi(xText), -100, 100);
+      const int newY = constrain(atoi(yText), -100, 100);
+
+      char headingValidText[2] = {};
+      const bool newHeadingValid =
+          httpd_query_key_value(
+              query, "headingValid", headingValidText,
+              sizeof(headingValidText)) == ESP_OK &&
+          strcmp(headingValidText, "1") == 0;
+
+      char zText[8] = {};
+      int newZ = 0;
+      if (newHeadingValid &&
+          httpd_query_key_value(query, "z", zText, sizeof(zText)) == ESP_OK) {
+          newZ = constrain(atoi(zText), 0, 359);
+      }
+
+      bool commandChanged;
+      portENTER_CRITICAL(&joystickMutex);
+      commandChanged = newX != currentCommand.x ||
+                      newY != currentCommand.y ||
+                      newZ != currentCommand.heading ||
+                      newHeadingValid != currentCommand.headingValid;
+      currentCommand.x = newX;
+      currentCommand.y = newY;
+      currentCommand.heading = newZ;
+      currentCommand.headingValid = newHeadingValid;
+      lastJoystickUpdate = millis();
+      portEXIT_CRITICAL(&joystickMutex);
+
+      if (commandChanged) {
+          if (newHeadingValid) {
+              Serial.printf(
+                  "Control command received: X: %d, Y: %d, heading: %d degrees\n",
+                  newX, newY, newZ);
+          } else {
+              Serial.printf(
+                  "Control command received: X: %d, Y: %d, heading unavailable\n",
+                  newX, newY);
+          }
+      }
+
+      httpd_resp_set_status(request, "204 No Content");
+      return httpd_resp_send(request, nullptr, 0);
+  }
 } // namespace
 
 namespace WebServer {
 
 void begin() {
+    IPAddress localIP(192, 168, 4, 1);
+    IPAddress gateway(192, 168, 4, 1);
+    IPAddress subnet(255, 255, 255, 0);
+
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+    if (!WiFi.softAPConfig(localIP, gateway, subnet)) {
+        Serial.println("Failed to configure the Wi-Fi access point IP.");
+        return;
+    }
+
+    if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+        Serial.println("Failed to start the Wi-Fi access point.");
+        return;
+    }
 
     Serial.println();
     Serial.println("Wi-Fi access point started.");
     Serial.print("Network name: ");
     Serial.println(AP_SSID);
-    Serial.print("Controller address: http://");
+    Serial.print("Controller address: https://");
     Serial.println(WiFi.softAPIP());
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        Serial.print("Webpage requested by ");
-        Serial.println(request->client()->remoteIP());
+    if (!LittleFS.begin(false)) {
+        Serial.println("LittleFS mount failed.");
+        return;
+    }
 
-        AsyncWebServerResponse *response =
-            request->beginResponse(200, "text/html", INDEX_HTML);
-        response->addHeader("Cache-Control", "no-store");
-        request->send(response);
-    });
+    File certFile = LittleFS.open("/certs/server.crt", "r");
+    File keyFile = LittleFS.open("/certs/server.key", "r");
 
-    server.on("/joystick", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!request->hasParam("x") || !request->hasParam("y")) {
-            Serial.print("Invalid joystick request from ");
-            Serial.println(request->client()->remoteIP());
-            request->send(400, "text/plain", "Missing x or y value");
-            return;
-        }
+    if (!certFile || !keyFile) {
+        Serial.println("Could not open the HTTPS certificate or private key.");
+        return;
+    }
 
-        const int newX = constrain(request->getParam("x")->value().toInt(), -100, 100);
-        const int newY = constrain(request->getParam("y")->value().toInt(), -100, 100);
-        const bool newHeadingValid = request->hasParam("headingValid") &&
-                                     request->getParam("headingValid")->value() == "1";
-        const int newZ = newHeadingValid && request->hasParam("z")
-            ? constrain(request->getParam("z")->value().toInt(), 0, 359)
-            : 0;
+    String serverCert = certFile.readString();
+    String serverKey = keyFile.readString();
+    certFile.close();
+    keyFile.close();
 
-        bool commandChanged;
-        portENTER_CRITICAL(&joystickMutex);
-        commandChanged = newX != currentCommand.x ||
-                         newY != currentCommand.y ||
-                         newZ != currentCommand.heading ||
-                         newHeadingValid != currentCommand.headingValid;
-        currentCommand.x = newX;
-        currentCommand.y = newY;
-        currentCommand.heading = newZ;
-        currentCommand.headingValid = newHeadingValid;
-        lastJoystickUpdate = millis();
-        portEXIT_CRITICAL(&joystickMutex);
+    if (serverCert.length() == 0 || serverKey.length() == 0) {
+        Serial.println("The HTTPS certificate or private key is empty.");
+        return;
+    }
 
-        // Heartbeats repeat the same command; log only actual changes.
-        if (commandChanged) {
-            if (newHeadingValid) {
-                Serial.printf("Control command received: X: %d, Y: %d, heading: %d degrees\n",
-                              newX, newY, newZ);
-            } else {
-                Serial.printf("Control command received: X: %d, Y: %d, heading unavailable\n",
-                              newX, newY);
-            }
-        }
-        request->send(204, "text/plain", "");
-    });
+    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
 
-    server.onNotFound([](AsyncWebServerRequest *request) {
-        Serial.print("Unknown page requested by ");
-        Serial.print(request->client()->remoteIP());
-        Serial.print(": ");
-        Serial.println(request->url());
-        request->send(404, "text/plain", "Not found");
-    });
+    // This SDK version names the server-certificate field cacert_pem.
+    config.cacert_pem =
+        reinterpret_cast<const uint8_t *>(serverCert.c_str());
+    config.cacert_len = serverCert.length() + 1;
+    config.prvtkey_pem =
+        reinterpret_cast<const uint8_t *>(serverKey.c_str());
+    config.prvtkey_len = serverKey.length() + 1;
 
-    server.begin();
+    // Two TLS connections allow page loading and controller requests.
+    config.httpd.max_open_sockets = 2;
+
+    esp_err_t result = httpd_ssl_start(&server, &config);
+    if (result != ESP_OK) {
+        Serial.printf("HTTPS server failed to start: %s\n",
+                      esp_err_to_name(result));
+        server = nullptr;
+        return;
+    }
+
+    httpd_uri_t rootUri{};
+    rootUri.uri = "/";
+    rootUri.method = HTTP_GET;
+    rootUri.handler = handleRoot;
+    rootUri.user_ctx = nullptr;
+
+    httpd_uri_t joystickUri{};
+    joystickUri.uri = "/joystick";
+    joystickUri.method = HTTP_GET;
+    joystickUri.handler = handleJoystick;
+    joystickUri.user_ctx = nullptr;
+
+    if (httpd_register_uri_handler(server, &rootUri) != ESP_OK ||
+        httpd_register_uri_handler(server, &joystickUri) != ESP_OK) {
+        Serial.println("Failed to register an HTTPS route.");
+        httpd_ssl_stop(server);
+        server = nullptr;
+        return;
+    }
+
     portENTER_CRITICAL(&joystickMutex);
     lastJoystickUpdate = millis();
     portEXIT_CRITICAL(&joystickMutex);
