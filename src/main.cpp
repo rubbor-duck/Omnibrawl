@@ -8,6 +8,8 @@ BLA::Matrix<3, 2> wheelMatrix;
 BLA::Matrix<2> inputVector;
 }
 
+const ControlCommand lastCommand;
+
 void initializeDrive() {
     // Same 3-wheel transformation matrix as the original.
     wheelMatrix = {1, 0, -0.5, 0.866025403784, -0.5, -0.866025403784};
@@ -25,8 +27,6 @@ void motor_matrix_translation(int x, int y, int heading) {
 void updateDrive() {
     const ControlCommand command = WebServer::getCommand();
     motor_matrix_translation(command.x, command.y, command.heading);
-    Serial.println("");
-
     // headingValid is reserved for the future heading-aware drive logic.
 }
 
