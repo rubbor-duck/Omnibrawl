@@ -1,24 +1,31 @@
 #include "web_server.hpp"
 
 #include <Arduino.h>
-#include <esp_https_server.h>
-#include <cstdlib>
-#include <cstring>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <WiFi.h>
-#include <LittleFS.h>
+#include <math.h>
+#include <BasicLinearAlgebra.h>
 
 namespace {
 constexpr char AP_SSID[] = "ESP32-Robot";
 constexpr char AP_PASSWORD[] = "123456789";
 constexpr unsigned long COMMAND_TIMEOUT_MS = 500;
 
-httpd_handle_t server = nullptr;
-portMUX_TYPE joystickMutex = portMUX_INITIALIZER_UNLOCKED;
-ControlCommand currentCommand;
-unsigned long lastJoystickUpdate = 0;
-uint8_t previousDeviceCount = 0;
 
-// Original webpage (including JS, compass and tilt controls), unchanged.
+AsyncWebServer server(80);
+
+// The web-server callback and loop() can run on different ESP32 CPU cores.
+// This lock keeps X, Y, Z, heading validity, and timestamp together.
+portMUX_TYPE joystickMutex = portMUX_INITIALIZER_UNLOCKED;
+
+// X and Y range from -100 to 100. Z is magnetic heading from 0 to 359 degrees.
+volatile int joystickX = 0;
+volatile int joystickY = 0;
+volatile int joystickZ = 0;
+volatile bool headingValid = false;
+volatile unsigned long lastJoystickUpdate = 0;
+
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -701,206 +708,136 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
-
-  esp_err_t handleRoot(httpd_req_t *request) {
-      httpd_resp_set_type(request, "text/html");
-      httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-      return httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-  }
-
-  esp_err_t handleJoystick(httpd_req_t *request) {
-      char query[128];
-      const size_t queryLength = httpd_req_get_url_query_len(request);
-
-      if (queryLength == 0 || queryLength >= sizeof(query) ||
-          httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK) {
-          return httpd_resp_send_err(
-              request, HTTPD_400_BAD_REQUEST, "Invalid query string");
-      }
-
-      char xText[8] = {};
-      char yText[8] = {};
-
-      if (httpd_query_key_value(query, "x", xText, sizeof(xText)) != ESP_OK ||
-          httpd_query_key_value(query, "y", yText, sizeof(yText)) != ESP_OK) {
-          return httpd_resp_send_err(
-              request, HTTPD_400_BAD_REQUEST, "Missing x or y value");
-      }
-
-      const int newX = constrain(atoi(xText), -100, 100);
-      const int newY = constrain(atoi(yText), -100, 100);
-
-      char headingValidText[2] = {};
-      const bool newHeadingValid =
-          httpd_query_key_value(
-              query, "headingValid", headingValidText,
-              sizeof(headingValidText)) == ESP_OK &&
-          strcmp(headingValidText, "1") == 0;
-
-      char zText[8] = {};
-      int newZ = 0;
-      if (newHeadingValid &&
-          httpd_query_key_value(query, "z", zText, sizeof(zText)) == ESP_OK) {
-          newZ = constrain(atoi(zText), 0, 359);
-      }
-
-      bool commandChanged;
-      portENTER_CRITICAL(&joystickMutex);
-      commandChanged = newX != currentCommand.x ||
-                      newY != currentCommand.y ||
-                      newZ != currentCommand.heading ||
-                      newHeadingValid != currentCommand.headingValid;
-      currentCommand.x = newX;
-      currentCommand.y = newY;
-      currentCommand.heading = newZ;
-      currentCommand.headingValid = newHeadingValid;
-      lastJoystickUpdate = millis();
-      portEXIT_CRITICAL(&joystickMutex);
-
-      if (commandChanged) {
-          if (newHeadingValid) {
-              Serial.printf(
-                  "Control command received: X: %d, Y: %d, heading: %d degrees\n",
-                  newX, newY, newZ);
-          } else {
-              Serial.printf(
-                  "Control command received: X: %d, Y: %d, heading unavailable\n",
-                  newX, newY);
-          }
-      }
-
-      httpd_resp_set_status(request, "204 No Content");
-      return httpd_resp_send(request, nullptr, 0);
-  }
 } // namespace
 
 namespace WebServer {
 
 void begin() {
-    IPAddress localIP(192, 168, 4, 1);
-    IPAddress gateway(192, 168, 4, 1);
-    IPAddress subnet(255, 255, 255, 0);
+      Serial.begin(115200);
 
-    WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
 
-    if (!WiFi.softAPConfig(localIP, gateway, subnet)) {
-        Serial.println("Failed to configure the Wi-Fi access point IP.");
-        return;
+  Serial.println();
+  Serial.println("Wi-Fi access point started.");
+  Serial.print("Network name: ");
+  Serial.println(AP_SSID);
+  Serial.print("Controller address: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.print("Webpage requested by ");
+    Serial.println(request->client()->remoteIP());
+
+    AsyncWebServerResponse *response =
+        request->beginResponse(200, "text/html", INDEX_HTML);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  server.on("/joystick", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("x") || !request->hasParam("y")) {
+      Serial.print("Invalid joystick request from ");
+      Serial.println(request->client()->remoteIP());
+      request->send(400, "text/plain", "Missing x or y value");
+      return;
     }
 
-    if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
-        Serial.println("Failed to start the Wi-Fi access point.");
-        return;
-    }
-
-    Serial.println();
-    Serial.println("Wi-Fi access point started.");
-    Serial.print("Network name: ");
-    Serial.println(AP_SSID);
-    Serial.print("Controller address: https://");
-    Serial.println(WiFi.softAPIP());
-
-    if (!LittleFS.begin(false)) {
-        Serial.println("LittleFS mount failed.");
-        return;
-    }
-
-    File certFile = LittleFS.open("/certs/server.crt", "r");
-    File keyFile = LittleFS.open("/certs/server.key", "r");
-
-    if (!certFile || !keyFile) {
-        Serial.println("Could not open the HTTPS certificate or private key.");
-        return;
-    }
-
-    String serverCert = certFile.readString();
-    String serverKey = keyFile.readString();
-    certFile.close();
-    keyFile.close();
-
-    if (serverCert.length() == 0 || serverKey.length() == 0) {
-        Serial.println("The HTTPS certificate or private key is empty.");
-        return;
-    }
-
-    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
-
-    // This SDK version names the server-certificate field cacert_pem.
-    config.cacert_pem =
-        reinterpret_cast<const uint8_t *>(serverCert.c_str());
-    config.cacert_len = serverCert.length() + 1;
-    config.prvtkey_pem =
-        reinterpret_cast<const uint8_t *>(serverKey.c_str());
-    config.prvtkey_len = serverKey.length() + 1;
-
-    // Two TLS connections allow page loading and controller requests.
-    config.httpd.max_open_sockets = 2;
-
-    esp_err_t result = httpd_ssl_start(&server, &config);
-    if (result != ESP_OK) {
-        Serial.printf("HTTPS server failed to start: %s\n",
-                      esp_err_to_name(result));
-        server = nullptr;
-        return;
-    }
-
-    httpd_uri_t rootUri{};
-    rootUri.uri = "/";
-    rootUri.method = HTTP_GET;
-    rootUri.handler = handleRoot;
-    rootUri.user_ctx = nullptr;
-
-    httpd_uri_t joystickUri{};
-    joystickUri.uri = "/joystick";
-    joystickUri.method = HTTP_GET;
-    joystickUri.handler = handleJoystick;
-    joystickUri.user_ctx = nullptr;
-
-    if (httpd_register_uri_handler(server, &rootUri) != ESP_OK ||
-        httpd_register_uri_handler(server, &joystickUri) != ESP_OK) {
-        Serial.println("Failed to register an HTTPS route.");
-        httpd_ssl_stop(server);
-        server = nullptr;
-        return;
-    }
+    const int newX =
+        constrain(request->getParam("x")->value().toInt(), -100, 100);
+    const int newY =
+        constrain(request->getParam("y")->value().toInt(), -100, 100);
+    const bool newHeadingValid = request->hasParam("headingValid") &&
+                                 request->getParam("headingValid")->value() == "1";
+    const int newZ = newHeadingValid && request->hasParam("z")
+                         ? constrain(request->getParam("z")->value().toInt(),
+                                     0, 359)
+                         : 0;
+    bool commandChanged;
 
     portENTER_CRITICAL(&joystickMutex);
+    commandChanged =
+        newX != joystickX || newY != joystickY || newZ != joystickZ ||
+        newHeadingValid != headingValid;
+    joystickX = newX;
+    joystickY = newY;
+    joystickZ = newZ;
+    headingValid = newHeadingValid;
     lastJoystickUpdate = millis();
     portEXIT_CRITICAL(&joystickMutex);
+
+    // Heartbeats repeat the same command, so only print values that change.
+    if (commandChanged) {
+      if (newHeadingValid) {
+        Serial.printf("Control command received: X: %d, Y: %d, heading: %d degrees\n",
+                      newX, newY, newZ);
+      } else {
+        Serial.printf("Control command received: X: %d, Y: %d, heading unavailable\n",
+                      newX, newY);
+      }
+    }
+
+    request->send(204, "text/plain", "");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    Serial.print("Unknown page requested by ");
+    Serial.print(request->client()->remoteIP());
+    Serial.print(": ");
+    Serial.println(request->url());
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  lastJoystickUpdate = millis();
 }
 
 void update() {
-    const uint8_t deviceCount = WiFi.softAPgetStationNum();
-    if (deviceCount != previousDeviceCount) {
-        if (deviceCount > previousDeviceCount) {
-            Serial.printf("Device connected to Wi-Fi. Connected devices: %u\n", deviceCount);
-        } else {
-            Serial.printf("Device disconnected from Wi-Fi. Connected devices: %u\n", deviceCount);
-        }
-        previousDeviceCount = deviceCount;
-    }
+    static uint8_t previousDeviceCount = 0;
+  const uint8_t deviceCount = WiFi.softAPgetStationNum();
 
-    bool commandTimedOut = false;
-    const unsigned long now = millis();
-    portENTER_CRITICAL(&joystickMutex);
-    if ((currentCommand.x != 0 || currentCommand.y != 0 || currentCommand.headingValid) &&
-        now - lastJoystickUpdate > COMMAND_TIMEOUT_MS) {
-        currentCommand = ControlCommand{};
-        commandTimedOut = true;
+  if (deviceCount != previousDeviceCount) {
+    if (deviceCount > previousDeviceCount) {
+      Serial.printf("Device connected to Wi-Fi. Connected devices: %u\n",
+                    deviceCount);
+    } else {
+      Serial.printf("Device disconnected from Wi-Fi. Connected devices: %u\n",
+                    deviceCount);
     }
-    portEXIT_CRITICAL(&joystickMutex);
+    previousDeviceCount = deviceCount;
+  }
 
-    if (commandTimedOut) {
-        Serial.println("Controller timed out; movement stopped and heading invalidated");
-    }
+  bool commandTimedOut = false;
+  const unsigned long now = millis();
+
+  portENTER_CRITICAL(&joystickMutex);
+  if ((joystickX != 0 || joystickY != 0 || headingValid) &&
+      now - lastJoystickUpdate > COMMAND_TIMEOUT_MS) {
+    joystickX = 0;
+    joystickY = 0;
+    joystickZ = 0;
+    headingValid = false;
+    commandTimedOut = true;
+  }
+  portEXIT_CRITICAL(&joystickMutex);
+
+  if (commandTimedOut) {
+    Serial.println("Controller timed out; movement stopped and heading invalidated");
+  }
 }
 
 ControlCommand getCommand() {
     ControlCommand snapshot;
     portENTER_CRITICAL(&joystickMutex);
-    snapshot = currentCommand;
+    snapshot.x = joystickX;
+    snapshot.y = joystickY;
+    snapshot.heading = joystickZ;
+    snapshot.headingValid = headingValid;
     portEXIT_CRITICAL(&joystickMutex);
+    
     return snapshot;
 }
 
 } // namespace WebServer
+
+
