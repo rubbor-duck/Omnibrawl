@@ -1,6 +1,9 @@
 #pragma once
 
 namespace Pins {
+
+    void initializePins();
+    
     // Motor 0
     constexpr int MOTOR0_EN = 32;
     constexpr int MOTOR0_STEP = 33;

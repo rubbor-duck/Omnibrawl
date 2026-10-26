@@ -1,10 +1,26 @@
+
 #include "motor_controller.hpp"
+#include "pins.hpp"
 #include <cmath>
 
-// Replace with your actual GPIO assignments
-static constexpr uint8_t STEP_PINS[3] = {25, 26, 27};
-static constexpr uint8_t DIR_PINS[3] = {14, 16, 17};
-static constexpr uint8_t ENABLE_PINS[3] = {18, 19, 21};
+// GPIO assignments from pins.hpp
+static constexpr int STEP_PINS[3] = {
+    Pins::MOTOR0_STEP,
+    Pins::MOTOR1_STEP,
+    Pins::MOTOR2_STEP
+};
+
+static constexpr int DIR_PINS[3] = {
+    Pins::MOTOR0_DIR,
+    Pins::MOTOR1_DIR,
+    Pins::MOTOR2_DIR
+};
+
+static constexpr int ENABLE_PINS[3] = {
+    Pins::MOTOR0_EN,
+    Pins::MOTOR1_EN,
+    Pins::MOTOR2_EN
+};
 
 void MotorController::begin() {
     engine.init();
@@ -37,7 +53,7 @@ void MotorController::setMotorPercentages(
 
         float percentage = percentages[i];
 
-        // Constrain to -100% through +100%
+        // Constrain between -100% and +100%
         percentage = fmaxf(-100.0f, fminf(100.0f, percentage));
 
         if (percentage == 0.0f) {
@@ -49,8 +65,9 @@ void MotorController::setMotorPercentages(
             fabsf(percentage) / 100.0f * MAX_SPEED_HZ
         );
 
-        // Avoid requesting zero steps/sec
-        if (speed == 0) speed = 1;
+        if (speed == 0) {
+            speed = 1;
+        }
 
         motors[i]->setSpeedInHz(speed);
 

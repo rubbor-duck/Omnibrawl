@@ -6,8 +6,8 @@ private:
     FastAccelStepperEngine engine;
     FastAccelStepper* motors[3] = {nullptr, nullptr, nullptr};
 
-    static constexpr uint32_t MAX_SPEED_HZ = 2000;
-    static constexpr uint32_t ACCELERATION = 1000;
+    static constexpr uint32_t MAX_SPEED_HZ = 1600;
+    static constexpr uint32_t ACCELERATION = 3200;
 
 public:
     void begin();

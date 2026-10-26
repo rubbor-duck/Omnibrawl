@@ -4,10 +4,15 @@
 #include "web_server.hpp"
 #include "robot.hpp"
 #include "movement.hpp"
+#include "pins.hpp"
+#include "motor_controller.hpp"
 
+MotorController motorController;
 
 void setup() {
     Serial.begin(115200);
+    Pins::initializePins();
+    motorController.begin();
     WebServer::begin();
     initializeTransformations();
 }
@@ -40,7 +45,30 @@ void loop() {
     //3. Store motor percentages in robot instance (USING ROBOT.CPP)
     robot1.setRobotMotorPercentages(motorPercentages[0], motorPercentages[1], motorPercentages[2]);
 
+
+
+
+    static unsigned long lastPrintMs = 0;
+    const unsigned long now = millis();
+
+    if (now - lastPrintMs >= 250) {
+        lastPrintMs = now;
+        Serial.printf(
+            "Joystick X:%d Y:%d | Motors: %.1f, %.1f, %.1f\n",
+            joystickX,
+            joystickY,
+            robot1.getRobotMotorPercentage(0),
+            robot1.getRobotMotorPercentage(1),
+            robot1.getRobotMotorPercentage(2)
+        );
+    }
+
     // 3. Apply robot's motor percentages to drivers (USING MOTOR_CONTROLLER.CPP)
-    // MotorDriver::update(robot.getMotorPercentages());
+    motorController.setMotorPercentages(
+        robot1.getRobotMotorPercentage(0), 
+        robot1.getRobotMotorPercentage(1), 
+        robot1.getRobotMotorPercentage(2)
+    );
+    
     
 }
