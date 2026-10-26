@@ -11,7 +11,7 @@ namespace Pins {
 
     // Motor 1
     constexpr int MOTOR1_EN = 26;
-    constexpr int MOTOR1_STEP = 17;
+    constexpr int MOTOR1_STEP = 27;
     constexpr int MOTOR1_DIR = 14;
 
     // Motor 2

@@ -53,9 +53,6 @@ void MotorController::setMotorPercentages(
 
         float percentage = percentages[i];
 
-        // Constrain between -100% and +100%
-        percentage = fmaxf(-100.0f, fminf(100.0f, percentage));
-
         if (percentage == 0.0f) {
             motors[i]->stopMove();
             continue;
