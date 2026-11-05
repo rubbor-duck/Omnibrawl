@@ -4,25 +4,25 @@
 #include <algorithm>
 
 
-namespace WebServer {
+namespace WebServer {       //connect webserber.cpp to RTOS
     void WSbegin();
     void WSupdate();
 }
 
 
 void Scheduler_StartTask(int period_ms, int priority, task_cb task) {
-    if (num_tasks < MAXTASKS) {
-        list_of_tasks_to_do[num_tasks].priority = priority;
+    if (num_tasks < MAXTASKS) {                                                 //if we haven't hit max # of tasks...
+        list_of_tasks_to_do[num_tasks].priority = priority;                 //retrieve priority
         
-        TickType_t period_ticks = pdMS_TO_TICKS(period_ms);
-        list_of_tasks_to_do[num_tasks].period = period_ticks;
+        TickType_t period_ticks = pdMS_TO_TICKS(period_ms);         //convert period specified in init() to ticks
+        list_of_tasks_to_do[num_tasks].period = period_ticks;       //set period of ticks
         // Schedule it to run after its first period, or immediately (current_tick)
         list_of_tasks_to_do[num_tasks].next_run_tick = xTaskGetTickCount() + period_ticks;
         list_of_tasks_to_do[num_tasks].suspended = false;
-        list_of_tasks_to_do[num_tasks].callback = task;
-        num_tasks++;
+        list_of_tasks_to_do[num_tasks].callback = task; 
+        num_tasks++;    //increment
 
-        std::sort(list_of_tasks_to_do, list_of_tasks_to_do + num_tasks, 
+        std::sort(list_of_tasks_to_do, list_of_tasks_to_do + num_tasks, //sorting code for task priority
             [](const taskControlBlock& a, const taskControlBlock& b) {
                 return a.priority < b.priority; // Ascending order: 0 comes first
             });
@@ -45,7 +45,7 @@ void scheduler() {
     // Fetch current tick dynamically inside the loop
     TickType_t current_tick = xTaskGetTickCount();  //ESP32 internal timer tick
 
-    for (int i = 0; i < num_tasks; i++) {
+    for (int i = 0; i < num_tasks; i++) {       //main scheduler loop logic 
         if (list_of_tasks_to_do[i].suspended) {
             continue; // Skip suspended tasks
         }
