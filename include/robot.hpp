@@ -7,13 +7,13 @@ private:
     bool motorEnabled[3] = {false, false, false};
 
 public:
-    void enableRobotMotors(bool m0State, bool m1State, bool m2State);
+    void enableRobotMotors(bool motor0Enabled, bool motor1Enabled, bool motor2Enabled);
 
     void setRobotMotorPercentages(
-        float m0Percentage,
-        float m1Percentage,
-        float m2Percentage
+        float motor0Percentage,
+        float motor1Percentage,
+        float motor2Percentage
     );
 
-    float getRobotMotorPercentage(int motor) const;
+    float getRobotMotorPercentage(int motorIndex) const;
 };

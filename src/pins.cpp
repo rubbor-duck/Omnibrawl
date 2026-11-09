@@ -4,6 +4,10 @@
 
 namespace Pins {
 
+// This function configures the ESP32 pins used by the robot's three motor
+// channels. It sets the pins to output mode and ensures the motor drivers start
+// in a safe disabled state before motion commands are sent.
+
 void initializePins() {
     // TMC2209 enable is active-low: HIGH keeps motors disabled.
     digitalWrite(MOTOR0_EN, HIGH);

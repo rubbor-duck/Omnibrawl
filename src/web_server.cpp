@@ -8,6 +8,8 @@
 #include <BasicLinearAlgebra.h>
 
 namespace {
+// This block defines the robot's Wi-Fi access point and the shared state used to
+// receive the joystick and heading data from the phone/web control page.
 constexpr char AP_SSID[] = "ESP32-Robot";
 constexpr char AP_PASSWORD[] = "123456789";
 constexpr unsigned long COMMAND_TIMEOUT_MS = 500;

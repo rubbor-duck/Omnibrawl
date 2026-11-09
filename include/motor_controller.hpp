@@ -12,6 +12,6 @@ private:
 public:
     void begin();
 
-    void setMotorPercentages(float m0, float m1, float m2);
+    void setMotorPercentages(float motor0Percent, float motor1Percent, float motor2Percent);
     void stopAll();
 };
