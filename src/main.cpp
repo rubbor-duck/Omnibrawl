@@ -1,6 +1,5 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include "scheduler_support.hpp"
 #include <algorithm>
 #include <Arduino.h>
 #include <BasicLinearAlgebra.h>
@@ -32,6 +31,8 @@ void webServerTask(void *parameter){
         joystickX = commandToRobot.x;
         joystickY = commandToRobot.y;
         phoneHeading = commandToRobot.heading;
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -39,6 +40,7 @@ void webServerTask(void *parameter){
 void imuSensor(void *parameter){
     for(;;){
         imuHeading = imuHeading;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -49,6 +51,7 @@ void motorCalc(void *parameter){
         
         //3. Store motor percentages in robot instance (USING ROBOT.CPP)
         robot1.setRobotMotorPercentages(motorPercentages[0], motorPercentages[1], motorPercentages[2]);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 

@@ -712,7 +712,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
 namespace WebServer {
 
-void WSbegin() {
+void begin() {
       Serial.begin(115200);
 
   WiFi.mode(WIFI_AP);
@@ -792,7 +792,7 @@ void WSbegin() {
   lastJoystickUpdate = millis();
 }
 
-void WSupdate() {
+void update() {
     static uint8_t previousDeviceCount = 0;
   const uint8_t deviceCount = WiFi.softAPgetStationNum();
 
