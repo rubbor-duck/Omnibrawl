@@ -16,6 +16,8 @@ TaskHandle_t motorCalcHandle = NULL;
 
 Robot robot1;
 
+MotorController motorController;
+
 std::array<float, 3> motorPercentages = {0.0, 0.0, 0.0};
 int joystickX = 0;
 int joystickY = 0;
@@ -51,6 +53,14 @@ void motorCalc(void *parameter){
         
         //3. Store motor percentages in robot instance (USING ROBOT.CPP)
         robot1.setRobotMotorPercentages(motorPercentages[0], motorPercentages[1], motorPercentages[2]);
+
+        // 3. Apply robot's motor percentages to drivers (USING MOTOR_CONTROLLER.CPP)
+        motorController.setMotorPercentages(
+            robot1.getRobotMotorPercentage(0), 
+            robot1.getRobotMotorPercentage(1), 
+            robot1.getRobotMotorPercentage(2)
+            );
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -88,8 +98,6 @@ void createRTOSTasks(){
 }
 
 
-
-MotorController motorController;
 
 void setup(){
     Serial.begin(115200);
